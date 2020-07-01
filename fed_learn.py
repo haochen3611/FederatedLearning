@@ -299,7 +299,7 @@ class BaseWorker(object):
         self._model.load_state_dict(state_dict)
 
 
-if __name__ == '__main__':
+def test_training(epoch=5):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     ts = MNIST('./data', train=True, download=True,
@@ -309,8 +309,8 @@ if __name__ == '__main__':
 
     te = MNIST('./data', train=False, download=True,
                transform=transforms.Compose([
-                         transforms.ToTensor(),
-                         transforms.Normalize((0.1307,), (0.3081,))]))
+                   transforms.ToTensor(),
+                   transforms.Normalize((0.1307,), (0.3081,))]))
 
     train_loader = torch.utils.data.DataLoader(ts, batch_size=128, shuffle=True)
 
@@ -321,10 +321,9 @@ if __name__ == '__main__':
     loss_func = nn.NLLLoss().to(device)
     train_loss = []
     train_step = []
-    epoch = 5
     steps = 0
     net.train()
-    for ep in range(1, epoch+1):
+    for ep in range(1, epoch + 1):
         for bat_idx, (inputs, labels) in enumerate(train_loader):
             inputs = inputs.to(device)
             labels = labels.to(device)
@@ -338,7 +337,7 @@ if __name__ == '__main__':
             if steps % 100 == 0:
                 print(f'Epoch {ep} Step {steps}: Train Loss: {loss.item(): .3f}')
                 train_loss.append(loss.item())
-                train_step.append(steps*128)
+                train_step.append(steps * 128)
                 # print(outputs)
                 # print(labels)
 
@@ -356,4 +355,66 @@ if __name__ == '__main__':
     test_loss /= len(TEST_SET)
     print(f'Test loss: {test_loss: .3f}')
     accuracy /= len(TEST_SET)
-    print(f'Accuracy: {accuracy*100: .2f}%')
+    print(f'Accuracy: {accuracy * 100: .2f}%')
+
+
+if __name__ == '__main__':
+    # ser = BaseServer()
+    # ser.routine(10)
+    epoch = 5
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    ts = MNIST('./data', train=True, download=True,
+               transform=transforms.Compose([
+                   transforms.ToTensor(),
+                   transforms.Normalize((0.1307,), (0.3081,))]))
+
+    te = MNIST('./data', train=False, download=True,
+               transform=transforms.Compose([
+                   transforms.ToTensor(),
+                   transforms.Normalize((0.1307,), (0.3081,))]))
+
+    train_loader = torch.utils.data.DataLoader(ts, batch_size=128, shuffle=True)
+
+    test_loader = data_utils.DataLoader(te, batch_size=1000, shuffle=True)
+
+    net = MLP().to(device)
+    opt = torch.optim.SGD(net.parameters(), lr=0.01)
+    loss_func = nn.NLLLoss().to(device)
+    train_loss = []
+    train_step = []
+    steps = 0
+    net.train()
+    for ep in range(1, epoch + 1):
+        for bat_idx, (inputs, labels) in enumerate(train_loader):
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+            steps += 1
+            opt.zero_grad()
+            outputs = net(inputs.flatten(start_dim=1))
+            loss = loss_func(outputs, labels)
+            loss.backward()
+            opt.step()
+
+            if steps % 100 == 0:
+                print(f'Epoch {ep} Step {steps}: Train Loss: {loss.item(): .3f}')
+                train_loss.append(loss.item())
+                train_step.append(steps * 128)
+                # print(outputs)
+                # print(labels)
+
+    test_loss = 0
+    accuracy = 0
+    net.eval()
+    with torch.no_grad():
+        for d, t in test_loader:
+            d = d.to(device)
+            t = t.to(device)
+            ot = net(d.flatten(start_dim=1))
+            test_loss += nn.NLLLoss()(ot, t).item()
+            pred = ot.argmax(1)
+            accuracy += pred.eq(t).sum().item()
+    test_loss /= len(TEST_SET)
+    print(f'Test loss: {test_loss: .3f}')
+    accuracy /= len(TEST_SET)
+    print(f'Accuracy: {accuracy * 100: .2f}%')
