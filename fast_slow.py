@@ -12,12 +12,12 @@ import random
 from read_logs import run_meta, read_meta_folder, run_stats, run_meta_update_logs, run_diagnosis
 from new_plots import generate_plots
 import datetime
-from typing import *
-import multiprocessing as mp
+from typing import Collection
+import torch.multiprocessing as mp
 
 
 def parallel_worker(worker_id, worker_func, result_queue, *args, **kwargs):
-    assert isinstance(result_queue, mp.Queue)
+    # assert isinstance(result_queue, mp.Queue)
     results = worker_func(*args, **kwargs)
     result_queue.put((worker_id, results))
 
@@ -26,22 +26,24 @@ class FedServer(Server_torch_auto):
 
     def __init__(self, **kwargs):
 
-        super(FedServer).__init__(**kwargs)
+        super(FedServer, self).__init__(**kwargs)
 
-        assert self.num_workers < mp.cpu_count(), 'More workers than number of devices!'
-
-        self._worker_learning_rate = self._validate_num_list_parameters(kwargs.pop('learning_rate',
-                                                                                   self.learning_rate))
+        self._worker_learning_rate = self._validate_num_list_parameters(kwargs.pop('worker_learning_rate',
+                                                                                   0.1))
         self._worker_lr_schedule = self._validate_num_list_parameters(kwargs.pop('worker_lr_schedule',
-                                                                                 self.lr_schedule))
+                                                                                 'const'))
         self._worker_lr_decay = self._validate_num_list_parameters(kwargs.pop('worker_lr_decay',
-                                                                              self.lr_decay))
+                                                                              0))
         self._worker_regularization = self._validate_num_list_parameters(kwargs.pop('worker_regularization',
-                                                                                    self.regularization))
+                                                                                    1))
         self._worker_speed = self._validate_num_list_parameters(kwargs.pop('worker_speed',
                                                                            torch.randint(1, 5,
                                                                                          (self.num_workers,)).tolist()))
+        assert self.num_workers < mp.cpu_count(), 'More workers than number of devices!'
+
         # self._result_queue = mp.Queue()
+
+        self.assign_workers()
 
     def train(self):
 
@@ -70,6 +72,8 @@ class FedServer(Server_torch_auto):
                     running_loss = running_loss * running_size
                     aux_grad_norm = self.compute_norm(self.aux_grads)
                 except Exception as e:
+                    print('Expection in computing aux gradient')
+                    print(e)
                     raise e
 
                 try:
@@ -139,20 +143,23 @@ class FedServer(Server_torch_auto):
 
                         # get worker gradients
                         try:
-                            processes = []
-                            result_queue = mp.Queue()
+                            # processes = []
+                            # result_queue = mp.Queue()
+                            # for ind, worker in enumerate(self.workers):
+                            #
+                            #     proc = mp.Process(target=parallel_worker,
+                            #                       args=(worker.id,
+                            #                             worker.compute_gradient,
+                            #                             result_queue))
+                            #     proc.start()
+                            #     processes.append(proc)
+                            #
+                            # for proc in processes:
+                            #     w_id, res_tuple = result_queue.get()
+                            #     temp, worker_loss, worker_correct, batch_size = res_tuple
+
                             for ind, worker in enumerate(self.workers):
-
-                                proc = mp.Process(target=parallel_worker,
-                                                  args=(worker.id,
-                                                        worker.compute_gradient,
-                                                        result_queue))
-                                proc.start()
-                                processes.append(proc)
-
-                            for proc in processes:
-                                w_id, res_tuple = result_queue.get()
-                                temp, worker_loss, worker_correct, batch_size = res_tuple
+                                temp, worker_loss, worker_correct, batch_size = worker.compute_gradient()
 
                                 for wg in temp:
                                     if torch.isnan(wg).any() or torch.isinf(wg).any():
@@ -172,15 +179,17 @@ class FedServer(Server_torch_auto):
                                 else:
                                     self.clip_(temp, max_norm=self.max_grad_norm)
 
-                                grads.append((w_id, temp))
-                                proc.join()
+                                grads.append(temp)
+                                # grads.append((w_id, temp))
+                                # proc.join()
 
-                            result_queue.close()
-                            grads.sort(key=lambda x: x[0], reverse=False)
-                            _, grads = zip(*grads)
+                            # result_queue.close()
+                            # grads.sort(key=lambda x: x[0], reverse=False)
+                            # _, grads = zip(*grads)
 
                         except Exception as e:
-                            print("exception in computing worker gradients", type(e))
+                            print("exception in computing worker gradients")
+                            print(e)
                             raise e
 
                         if self.update_rule in ["average_aux"]:
@@ -437,8 +446,8 @@ class FedServer(Server_torch_auto):
             self.worker_kappas.append(worker.const)
 
     def _validate_num_list_parameters(self, param):
-        assert isinstance(param, (list, tuple, np.ndarray, torch.Tensor, int, float))
-        if isinstance(param, Collection):
+        assert isinstance(param, (list, tuple, np.ndarray, torch.Tensor, int, float, str))
+        if isinstance(param, Collection) and not isinstance(param, str):
             assert len(param) == self.num_workers, 'Length of the parameter must equal num of workers'
             for ag in param:
                 assert isinstance(ag, (int, float)), 'Elements of the input must be int or float'
@@ -452,14 +461,14 @@ class FedWorker(Worker_torch):
 
     def __init__(self, *args, **kwargs):
 
-        super(FedWorker).__init__(*args, **kwargs)
-
-        self._worker_iterations = kwargs.pop('speed', 1)
-        self._learning_rate = kwargs.pop('learning_rate', 0.001)
+        self._worker_iterations = int(kwargs.pop('speed', 1))
+        self._learning_rate = float(kwargs.pop('learning_rate', 0.001))
         self._init_lr = self._learning_rate
-        self._regularization = kwargs.pop('regularization', 1)
-        self._rl_schedule = kwargs.pop('lr_schedule', 'const')
-        self._rl_decay = kwargs.pop('lr_decay', 0)
+        self._regularization = float(kwargs.pop('regularization', 1))
+        self._rl_schedule = str(kwargs.pop('lr_schedule', 'const'))
+        self._rl_decay = float(kwargs.pop('lr_decay', 0))
+
+        super(FedWorker, self).__init__(*args, **kwargs)
 
         self._step_counter = 0
         self._round_counter = 0
@@ -492,7 +501,7 @@ class FedWorker(Worker_torch):
     def _compute_gradient(self):
 
         data_X, data_Y = self.get_data()
-        self.get_server_weights()
+        # self.get_server_weights()
 
         out = self.model.forward(data_X)
         loss = self.loss_fn(out, data_Y)
@@ -531,12 +540,12 @@ class FedWorker(Worker_torch):
 
         return grads, loss.data, correct, data_Y.size(0)
 
-    def compute_gradient(self, iterations=None):
+    def compute_gradient(self, iterations: int = None):
         self._round_counter += 1
         if iterations is None:
             iterations = self._worker_iterations
         gradient, last_loss, last_correct, last_batch_size = [None] * 4
-        for _ in iterations:
+        for _ in range(iterations):
             self._step_counter += 1
             grad, last_loss, last_correct, last_batch_size = self._compute_gradient()
             updates = self._update_parameters(grad)
@@ -784,9 +793,15 @@ if __name__ == '__main__':
 
             else:
                 raise NotImplementedError
-
         else:
             pass
+
+        config['worker_learning_rate'] = config['learning_rate']
+        config['worker_lr_schedule'] = config['lr_schedule']
+        config['worker_lr_decay'] = config['lr_decay']
+        config['worker_regularization'] = config['regularization']
+        config['worker_speed'] = [5, 3, 5, 3, 5, 3]
+        config['device'] = 'cpu'
 
         if config['manual_seed'] == -1:
             seed_ = torch.get_rng_state()
@@ -813,7 +828,7 @@ if __name__ == '__main__':
 
             config["folder"] = folder
 
-            stor = Server_torch_auto(**config)
+            stor = FedServer(**config)
             print(config)
 
             try:
