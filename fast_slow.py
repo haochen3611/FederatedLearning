@@ -12,18 +12,413 @@ import random
 from read_logs import run_meta, read_meta_folder, run_stats, run_meta_update_logs, run_diagnosis
 from new_plots import generate_plots
 import datetime
+from typing import *
+import multiprocessing as mp
+
+
+def parallel_worker(worker_id, worker_func, result_queue, *args, **kwargs):
+    assert isinstance(result_queue, mp.Queue)
+    results = worker_func(*args, **kwargs)
+    result_queue.put((worker_id, results))
 
 
 class FedServer(Server_torch_auto):
 
     def __init__(self, **kwargs):
-        self.worker_learning_rate = kwargs.pop('learning_rate', 0.001)
-        self.worker_lr_schedule = kwargs.pop('worker_lr_schedule', 'const')
-        self.worker_lr_decay = kwargs.pop('worker_lr_decay', 0)
+
         super(FedServer).__init__(**kwargs)
 
+        assert self.num_workers < mp.cpu_count(), 'More workers than number of devices!'
+
+        self._worker_learning_rate = self._validate_num_list_parameters(kwargs.pop('learning_rate',
+                                                                                   self.learning_rate))
+        self._worker_lr_schedule = self._validate_num_list_parameters(kwargs.pop('worker_lr_schedule',
+                                                                                 self.lr_schedule))
+        self._worker_lr_decay = self._validate_num_list_parameters(kwargs.pop('worker_lr_decay',
+                                                                              self.lr_decay))
+        self._worker_regularization = self._validate_num_list_parameters(kwargs.pop('worker_regularization',
+                                                                                    self.regularization))
+        self._worker_speed = self._validate_num_list_parameters(kwargs.pop('worker_speed',
+                                                                           torch.randint(1, 5,
+                                                                                         (self.num_workers,)).tolist()))
+        # self._result_queue = mp.Queue()
+
+    def train(self):
+
+        print("start training")
+        worker_size = len(self.partitions[0])
+
+        num_iters = worker_size // self.batch_size
+
+        # for param in self.model.parameters():
+        # param.data = 1000* param.data
+
+        for epoch in range(self.num_epochs):
+            self.epoch = epoch
+            for itr in range(num_iters):
+
+                self.cum_itr += 1
+                self.lr_update()
+
+                grads = []
+                try:
+                    # compute gradients using aux data
+                    running_loss, running_correct, running_size = self.compute_aux_grad()
+                    if self.clip_aux:
+                        self.clip_(self.aux_grads, max_norm=self.max_grad_norm)
+
+                    running_loss = running_loss * running_size
+                    aux_grad_norm = self.compute_norm(self.aux_grads)
+                except Exception as e:
+                    raise e
+
+                try:
+                    if self.update_rule == "aux":
+                        self.update_parameters(self.aux_grads)
+
+                        self.logger.update("dot_aux_updated", aux_grad_norm)
+                        self.logger.update("aux_diff_ugrad", 0)
+                        self.logger.update("updated_grad_norm", aux_grad_norm)
+
+                    elif self.update_rule == "benign_aux":
+                        processes = []
+                        result_queue = mp.Queue()
+                        for ind, worker in enumerate(self.workers):
+                            if worker.adversary_type == 0:
+                                proc = mp.Process(target=parallel_worker,
+                                                  args=(worker.id,
+                                                        worker.compute_gradient,
+                                                        result_queue))
+                                proc.start()
+                                processes.append(proc)
+
+                        for proc in processes:
+                            w_id, res_tuple = result_queue.get()
+                            temp, worker_loss, worker_correct, batch_size = res_tuple
+
+                            for wg in temp:
+                                if torch.isnan(wg).any() or torch.isinf(wg).any():
+                                    # self.nan_handler(msg=str(worker_.id) + 'grad')
+                                    raise Exception('found Nan/Inf values')
+
+                            if torch.isnan(worker_loss) or torch.isinf(worker_loss).any():
+                                # self.nan_handler(msg=str(worker_.id) + 'loss')
+                                raise Exception('found Nan/Inf values')
+
+                            running_loss += worker_loss * batch_size
+                            running_size += batch_size
+                            running_correct += worker_correct
+
+                            if self.clip_with_aux:
+                                self.clip_(temp, max_norm=aux_grad_norm)
+                            else:
+                                self.clip_(temp, max_norm=self.max_grad_norm)
+                            grads.append((w_id, temp))
+                            proc.join()
+
+                        result_queue.close()
+                        grads.sort(key=lambda x: x[0], reverse=False)
+                        _, grads = zip(*grads)
+
+                        temp_size = len(self.benign) * self.batch_size + self.aux_size
+                        temp_weights = [self.aux_size / temp_size] + [self.batch_size / temp_size] * len(self.benign)
+                        temp_grads = [self.aux_grads] + [grads[ind] for ind in range(len(self.benign))]
+                        averaged_grads = self.compute_weighted_grad(temp_grads, weights=temp_weights)
+                        self.update_parameters(averaged_grads)
+
+                        dot_aux_updated = self.compute_dot_product(self.aux_grads, averaged_grads)
+                        aux_diff_ugrad = self.compute_norm_diff(self.aux_grads, averaged_grads)
+                        averaged_grad_norm = self.compute_norm(averaged_grads)
+
+                        self.logger.update("dot_aux_updated", dot_aux_updated)
+                        self.logger.update("aux_diff_ugrad", aux_diff_ugrad)
+                        self.logger.update("updated_grad_norm", averaged_grad_norm)
+
+                    else:
+                        # update rule requires knowing all gradients.
+
+                        # get worker gradients
+                        try:
+                            processes = []
+                            result_queue = mp.Queue()
+                            for ind, worker in enumerate(self.workers):
+
+                                proc = mp.Process(target=parallel_worker,
+                                                  args=(worker.id,
+                                                        worker.compute_gradient,
+                                                        result_queue))
+                                proc.start()
+                                processes.append(proc)
+
+                            for proc in processes:
+                                w_id, res_tuple = result_queue.get()
+                                temp, worker_loss, worker_correct, batch_size = res_tuple
+
+                                for wg in temp:
+                                    if torch.isnan(wg).any() or torch.isinf(wg).any():
+                                        # self.nan_handler(msg=str(worker_.id) + 'grad')
+                                        raise Exception('found Nan/Inf values')
+
+                                if torch.isnan(worker_loss) or torch.isinf(worker_loss).any():
+                                    # self.nan_handler(msg=str(worker_.id) + 'loss')
+                                    raise Exception('found Nan/Inf values')
+
+                                running_loss += worker_loss * batch_size
+                                running_size += batch_size
+                                running_correct += worker_correct
+
+                                if self.clip_with_aux:
+                                    self.clip_(temp, max_norm=aux_grad_norm)
+                                else:
+                                    self.clip_(temp, max_norm=self.max_grad_norm)
+
+                                grads.append((w_id, temp))
+                                proc.join()
+
+                            result_queue.close()
+                            grads.sort(key=lambda x: x[0], reverse=False)
+                            _, grads = zip(*grads)
+
+                        except Exception as e:
+                            print("exception in computing worker gradients", type(e))
+                            raise e
+
+                        if self.update_rule in ["average_aux"]:
+                            # compute averaged grads including aux grad
+                            # Is this method even used?
+                            temp_size = self.num_workers * self.batch_size + self.aux_size
+                            temp_weights = [self.aux_size / temp_size] + [
+                                self.batch_size / temp_size] * self.num_workers
+                            temp = [self.aux_grads] + grads
+
+                            averaged_grads = self.compute_weighted_grad(temp, weights=temp_weights)
+                            self.update_parameters(averaged_grads)
+
+                            dot_aux_updated = self.compute_dot_product(self.aux_grads, averaged_grads)
+                            aux_diff_ugrad = self.compute_norm_diff(self.aux_grads, averaged_grads)
+                            averaged_grad_norm = self.compute_norm(averaged_grads)
+
+                            self.logger.update("dot_aux_updated", dot_aux_updated)
+                            self.logger.update("aux_diff_ugrad", aux_diff_ugrad)
+                            self.logger.update("updated_grad_norm", averaged_grad_norm)
+
+                        elif self.update_rule == "custom":
+                            # get custom ids to update with
+                            self.get_custom_ids(grads, self.custom_update_rule)
+                            # average those custom ids
+                            # self.update_parameters(meta_updated_grads)
+
+                        elif self.update_rule in ["ByGARS"]:
+                            # log individual worker gradient related metrics
+                            for ind in range(self.num_workers):
+                                self.logger.update("worker_grad_norm_" + str(ind), self.compute_norm(grads[ind]))
+                                self.logger.update("worker_grad_dot_aux_" + str(ind),
+                                                   self.compute_dot_product(self.aux_grads, grads[ind]))
+                                self.logger.update("worker_grad_diff_aux_" + str(ind),
+                                                   self.compute_norm_diff(self.aux_grads, grads[ind]))
+
+                            # compute metrics on received gradients with current self.weights
+                            received_grads = self.compute_weighted_grad(grads)
+                            received_grad_norm = self.compute_norm(received_grads)
+                            dot_aux_received = self.compute_dot_product(self.aux_grads, received_grads)
+                            aux_diff_rgrad = self.compute_norm_diff(self.aux_grads, received_grads)
+
+                            self.logger.update("received_grad_norm", received_grad_norm)
+                            self.logger.update("dot_aux_received", dot_aux_received)
+                            self.logger.update("aux_diff_rgrad", aux_diff_rgrad)
+
+                            try:
+                                self.aggregate_gradients(grads)
+                            except Exception as e:
+                                print("Exception raised in aggregate weighted: ", e)
+                                # log everything at the server
+                                self.logger.update("updated_grad_norm", None)
+                                self.logger.update("dot_aux_updated", None)
+                                self.logger.update("aux_diff_ugrad", None)
+
+                                for ind in range(self.num_workers):
+                                    self.logger.update("worker_weight_" + str(ind), self.weights[ind])
+                                    self.logger.update("worker_weight_avg_" + str(ind), self.averaged_weights[ind])
+
+                                self.logger.save_log(self.folder + self.filename)
+                                raise e
+
+                            meta_updated_grads = self.compute_weighted_grad(grads)
+
+                            meta_updated_grad_norm = self.compute_norm(meta_updated_grads)
+                            dot_aux_updated = self.compute_dot_product(self.aux_grads, meta_updated_grads)
+                            aux_diff_ugrad = self.compute_norm_diff(self.aux_grads, meta_updated_grads)
+
+                            if self.update_rule in ["ByGARS", "no_adv_weighted"]:
+                                self.update_parameters(meta_updated_grads)
+                            else:
+                                # already computed in self.aggregate_gradients: GABBAR+
+                                pass
+
+                            self.logger.update("updated_grad_norm", meta_updated_grad_norm)
+                            self.logger.update("dot_aux_updated", dot_aux_updated)
+                            self.logger.update("aux_diff_ugrad", aux_diff_ugrad)
+
+                            self.logger.update("received_diff_updated",
+                                               self.compute_norm_diff(received_grads, meta_updated_grads))
+                            self.logger.update("received_dot_updated",
+                                               self.compute_dot_product(received_grads, meta_updated_grads))
+
+                            self.logger.update("weights_norm", np.linalg.norm(self.weights))
+
+                            self.logger.update("kTq", np.dot(self.weights, self.worker_kappas))
+                            self.logger.update("kTqavg", np.dot(self.averaged_weights, self.worker_kappas))
+
+                            for ind in range(self.num_workers):
+                                self.logger.update("worker_weight_" + str(ind), self.weights[ind])
+                                self.logger.update("worker_weight_avg_" + str(ind), self.averaged_weights[ind])
+
+                        elif self.update_rule == "ByGARS++":
+                            # log individual worker gradient related metrics
+                            for ind in range(self.num_workers):
+                                self.logger.update("worker_grad_norm_" + str(ind), self.compute_norm(grads[ind]))
+                                self.logger.update("worker_grad_dot_aux_" + str(ind),
+                                                   self.compute_dot_product(self.aux_grads, grads[ind]))
+                                self.logger.update("worker_grad_diff_aux_" + str(ind),
+                                                   self.compute_norm_diff(self.aux_grads, grads[ind]))
+
+                            # compute metrics on received gradients with current self.weights
+                            received_grads = self.compute_weighted_grad(grads)
+                            received_grad_norm = self.compute_norm(received_grads)
+                            dot_aux_received = self.compute_dot_product(self.aux_grads, received_grads)
+                            aux_diff_rgrad = self.compute_norm_diff(self.aux_grads, received_grads)
+
+                            self.logger.update("received_grad_norm", received_grad_norm)
+                            self.logger.update("dot_aux_received", dot_aux_received)
+                            self.logger.update("aux_diff_rgrad", aux_diff_rgrad)
+
+                            # update parameters with old weighted sum gradients
+                            self.update_parameters(received_grads)
+                            # with torch.no_grad():
+                            #     for param1, param2 in zip(self.model.parameters(), received_grads):
+                            #         param1.data -= self.learning_rate * param2.to(self.device)
+
+                            # update q_t weights
+                            weight_grad = []
+                            for i in range(self.num_workers):
+                                temp = 0
+                                with torch.no_grad():
+                                    for param1, param2 in zip(grads[i], self.aux_grads):
+                                        temp += torch.sum(torch.mul(param1.data, param2.data))
+
+                                # temp = -temp * self.learning_rate
+                                if self.use_lr_inmeta:
+                                    temp = -temp * self.learning_rate
+                                else:
+                                    temp = -temp
+                                # regularization
+                                # temp += self.meta_regularization * (self.weights[i] - self.averaged_weights[i])
+                                # weight_grad.append(temp)
+                                #
+                                # self.weights[i] -= self.meta_learning_rate * temp
+
+                                if self.meta_update_type == "gradupdate":
+                                    # regularization
+                                    temp += self.meta_regularization * (self.weights[i] - self.averaged_weights[i])
+                                    weight_grad.append(temp)
+
+                                    self.weights[i] -= self.meta_learning_rate * temp
+                                elif self.meta_update_type == 'stochavg':
+                                    # stochavg inherently does regularization rite?
+                                    self.weights[i] = (1 - self.meta_learning_rate) * self.weights[
+                                        i] + self.meta_learning_rate * (-temp)
+                                else:
+                                    raise NotImplementedError
+
+                            self.averaged_weights = ((self.cum_itr - 1) * self.averaged_weights +
+                                                     self.weights) / self.cum_itr
+
+                            meta_updated_grads = self.compute_weighted_grad(grads)
+
+                            meta_updated_grad_norm = self.compute_norm(meta_updated_grads)
+                            dot_aux_updated = self.compute_dot_product(self.aux_grads, meta_updated_grads)
+                            aux_diff_ugrad = self.compute_norm_diff(self.aux_grads, meta_updated_grads)
+
+                            self.logger.update("updated_grad_norm", meta_updated_grad_norm)
+                            self.logger.update("dot_aux_updated", dot_aux_updated)
+                            self.logger.update("aux_diff_ugrad", aux_diff_ugrad)
+
+                            self.logger.update("received_diff_updated",
+                                               self.compute_norm_diff(received_grads, meta_updated_grads))
+                            self.logger.update("received_dot_updated",
+                                               self.compute_dot_product(received_grads, meta_updated_grads))
+
+                            self.logger.update("weights_norm", np.linalg.norm(self.weights))
+
+                            self.logger.update("kTq", np.dot(self.weights, self.worker_kappas))
+                            self.logger.update("kTqavg", np.dot(self.averaged_weights, self.worker_kappas))
+
+                            for ind in range(self.num_workers):
+                                self.logger.update("worker_weight_" + str(ind), self.weights[ind])
+                                self.logger.update("worker_weight_avg_" + str(ind), self.averaged_weights[ind])
+
+                        elif self.update_rule in ['average']:
+                            # average weights
+
+                            temp_size = self.num_workers * self.batch_size + self.aux_size
+                            temp_weights = [self.aux_size / temp_size] + [
+                                self.batch_size / temp_size] * self.num_workers
+                            temp = [self.aux_grads] + grads
+
+                            averaged_grads = self.compute_weighted_grad(temp, weights=temp_weights)
+                            self.update_parameters(averaged_grads)
+
+                            dot_aux_updated = self.compute_dot_product(self.aux_grads, averaged_grads)
+                            aux_diff_ugrad = self.compute_norm_diff(self.aux_grads, averaged_grads)
+                            averaged_grad_norm = self.compute_norm(averaged_grads)
+
+                            self.logger.update("dot_aux_updated", dot_aux_updated)
+                            self.logger.update("aux_diff_ugrad", aux_diff_ugrad)
+                            self.logger.update("updated_grad_norm", averaged_grad_norm)
+
+                        else:
+                            raise NotImplementedError
+
+                except Exception as e:
+                    print("Exception raise in update_parameters: ", e)
+                    # log everything at the server
+                    self.logger.save_log(self.folder + self.filename)
+                    raise e
+
+                param_norm = self.compute_norm(self.model.parameters())
+
+                self.logger.update("epoch", self.epoch)
+                self.logger.update("itr", self.cum_itr)
+                self.logger.update("lr", self.learning_rate)
+                self.logger.update("meta_lr", self.meta_learning_rate)
+                self.logger.update("regularization", self.regularization)
+                self.logger.update("param_norm", param_norm)
+                self.logger.update("aux_grad_norm", aux_grad_norm)
+
+                self.logger.update("running_train_loss", running_loss.item() / running_size)
+                self.logger.update("running_train_acc", running_correct / running_size)
+
+                if itr % self.log_freq == 0:
+                    self.log_inference(itr)
+
+            self.log_inference(itr, model_save=True)
+
+        self.stats_logger.save_log(self.folder + "stats.csv")
+        # print("saved stats")
+        self.logger.save_log(self.folder + "log.csv")
+        # print("saved log")
+        self.meta_logger.save_log(self.folder + "meta_log.csv")
+        # print("saved meta log")
+
+        results = dict()
+        results["best_loss"] = self.best_ts_loss.item()
+        results["best_acc"] = self.best_ts_acc
+        with open(self.folder + "results.json", 'w') as fp:
+            json.dump(results, fp, indent=2)
+
+        # print("end training")
+
     def assign_workers(self):
-        worker_speeds = torch.randint(1, 5, (self.num_workers,)).numpy()
 
         for k in range(self.num_workers):
             subset = Subset(self.train_data, self.partitions[k])
@@ -32,24 +427,39 @@ class FedServer(Server_torch_auto):
                                self.device, self.loss_fn_,
                                type_=self.adv_ids[k],
                                abs_=self.abs_,
-                               worker_speed=worker_speeds[k],
-                               worker_lr=0.001,
-                               worker_regularization=0.1)
+                               speed=self._worker_speed[k],
+                               learning_rate=self._worker_learning_rate[k],
+                               regularization=self._worker_regularization[k],
+                               lr_schedule=self._worker_lr_schedule[k],
+                               lr_decay=self._worker_lr_decay[k])
 
             self.workers.append(worker)
             self.worker_kappas.append(worker.const)
+
+    def _validate_num_list_parameters(self, param):
+        assert isinstance(param, (list, tuple, np.ndarray, torch.Tensor, int, float))
+        if isinstance(param, Collection):
+            assert len(param) == self.num_workers, 'Length of the parameter must equal num of workers'
+            for ag in param:
+                assert isinstance(ag, (int, float)), 'Elements of the input must be int or float'
+        else:
+            param = [param] * self.num_workers
+
+        return param
 
 
 class FedWorker(Worker_torch):
 
     def __init__(self, *args, **kwargs):
-        self._worker_iterations = kwargs.pop('worker_speed', 1)
-        self._learning_rate = kwargs.pop('worker_lr', 0.001)
-        self._init_lr = self._learning_rate
-        self._regularization = kwargs.pop('worker_regularization', 1)
-        self._rl_schedule = kwargs.pop('worker_rl_schedule', 'const')
-        self._rl_decay = kwargs.pop('worker_rl_decay', 0)
+
         super(FedWorker).__init__(*args, **kwargs)
+
+        self._worker_iterations = kwargs.pop('speed', 1)
+        self._learning_rate = kwargs.pop('learning_rate', 0.001)
+        self._init_lr = self._learning_rate
+        self._regularization = kwargs.pop('regularization', 1)
+        self._rl_schedule = kwargs.pop('lr_schedule', 'const')
+        self._rl_decay = kwargs.pop('lr_decay', 0)
 
         self._step_counter = 0
         self._round_counter = 0
@@ -80,7 +490,6 @@ class FedWorker(Worker_torch):
         return updates
 
     def _compute_gradient(self):
-        self._step_counter += 1
 
         data_X, data_Y = self.get_data()
         self.get_server_weights()
@@ -128,8 +537,10 @@ class FedWorker(Worker_torch):
             iterations = self._worker_iterations
         gradient, last_loss, last_correct, last_batch_size = [None] * 4
         for _ in iterations:
+            self._step_counter += 1
             grad, last_loss, last_correct, last_batch_size = self._compute_gradient()
             updates = self._update_parameters(grad)
+            self._update_rl()
             if gradient is None:
                 gradient = updates
             else:
@@ -206,29 +617,6 @@ def get_arguments():
 
 
 if __name__ == '__main__':
-    # num_workers = 5
-    # adv_ids = [0] * 5
-    #
-    # server_config = {'num_workers': num_workers,
-    #                  'adv_ids': adv_ids,
-    #                  'aux_size': 100,
-    #                  'model': "vggsmall",
-    #                  'loss_fn': "cross_entropy",
-    #                  'dataset': "CIFAR10",
-    #                  'location': "data/",
-    #                  'batch_size': 64,
-    #                  'folder': "logs/",
-    #                  'filename': "log_00.csv",
-    #                  'num_meta_itr': 0,
-    #                  'learning_rate': 0.05,
-    #                  'meta_learning_rate': 0.01,
-    #                  'meta_regularization': 1,
-    #                  'lr_decay': 0.05,
-    #                  'lr_schedule': 'decay',
-    #                  'meta_lr_decay': 0.05,
-    #                  'q_init': 'zero'}
-    #
-    # fed_server = FedServer(**server_config)
 
     logs_folder = "new_final_logs/"
     data_folder = "data/"
@@ -239,13 +627,13 @@ if __name__ == '__main__':
     if not os.path.exists(data_folder):
         os.makedirs(data_folder)
 
-    args = get_arguments()
+    arguments = get_arguments()
 
-    dataset = args.dataset
+    dataset = arguments.dataset
     if not os.path.exists(logs_folder + dataset + "/"):
         os.makedirs(logs_folder + dataset + "/")
 
-    config = vars(args)
+    config = vars(arguments)
 
 ##############################################
     """
@@ -300,12 +688,16 @@ if __name__ == '__main__':
 
             if config['num_good_workers'] == 0:
                 adv_ids_ = [1, 2, 2, 2, 3, 3]
+            elif config['num_good_workers'] == 6:
+                adv_ids_ = [0, 0, 0, 0, 0, 0]
             else:
                 adv_ids_ = [0, 1, 2, 2, 3, 3]
 
         elif config['dataset'] == 'CIFAR10':
             if config['num_good_workers'] == 0:
                 adv_ids_ = [1, 2, 3, 3]
+            elif config['num_good_workers'] == 4:
+                adv_ids_ = [0, 0, 0, 0]
             else:
                 adv_ids_ = [0, 1, 2, 3]
 
@@ -411,7 +803,7 @@ if __name__ == '__main__':
         pickle.dump(np_seed_, open(exp_folder + 'npseed.p', 'wb'))
 
         with open(exp_folder + "config.json", 'w') as fp:
-            json.dump(args.__dict__, fp, indent=2)
+            json.dump(arguments.__dict__, fp, indent=2)
 
         for trial in range(config['num_trials']):
 
